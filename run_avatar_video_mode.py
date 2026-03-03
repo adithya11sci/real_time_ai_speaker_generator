@@ -1,6 +1,7 @@
 """
-Interactive AI Avatar - Real-time with Display Window
-Choose between text input or microphone input
+AI Avatar - Auto-Play Video Mode
+Generates video and automatically plays it in your default video player
+No "not responding" issues!
 """
 import sys
 import os
@@ -9,9 +10,7 @@ import numpy as np
 import cv2
 import logging
 from pathlib import Path
-import threading
-import queue
-import time
+import subprocess
 
 # Setup path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -31,94 +30,8 @@ from tts.edge_tts_stream import EdgeTTSStream
 from lipsync.wav2lip_processor import Wav2LipProcessor
 
 
-class DisplayThread(threading.Thread):
-    """Separate thread for OpenCV display operations"""
-    
-    def __init__(self, window_name="AI Avatar", target_fps=25):
-        super().__init__(daemon=True)
-        self.window_name = window_name
-        self.target_fps = target_fps
-        self.frame_time = 1.0 / target_fps
-        self.frame_queue = queue.Queue(maxsize=30)
-        self.running = True
-        self.fps_counter = []
-        self.last_frame_time = 0
-        
-    def run(self):
-        """Display loop - runs in separate thread"""
-        try:
-            # Create window
-            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self.window_name, 1280, 720)
-            
-            logger.info(f"✅ Display window opened at {self.target_fps} FPS")
-            
-            while self.running:
-                try:
-                    frame = self.frame_queue.get(timeout=0.1)
-                    
-                    if frame is None:
-                        continue
-                    
-                    # Calculate FPS
-                    current_time = time.time()
-                    if self.last_frame_time > 0:
-                        fps = 1.0 / (current_time - self.last_frame_time)
-                        self.fps_counter.append(fps)
-                        if len(self.fps_counter) > 30:
-                            self.fps_counter.pop(0)
-                    self.last_frame_time = current_time
-                    
-                    # Add FPS overlay
-                    frame = frame.copy()
-                    avg_fps = np.mean(self.fps_counter) if self.fps_counter else 0
-                    cv2.putText(frame, f"FPS: {avg_fps:.1f}", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(frame, "Press 'q' to quit", (10, 70),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    
-                    # Display
-                    cv2.imshow(self.window_name, frame)
-                    
-                    # Handle keyboard
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q') or key == 27:
-                        logger.info("Quit key pressed")
-                        self.running = False
-                        break
-                    
-                    # FPS control
-                    elapsed = time.time() - current_time
-                    if elapsed < self.frame_time:
-                        time.sleep(self.frame_time - elapsed)
-                        
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    logger.error(f"Display error: {e}")
-                    break
-                    
-        finally:
-            cv2.destroyAllWindows()
-            logger.info("Display window closed")
-    
-    def show_frame(self, frame):
-        """Add frame to display queue"""
-        if not self.running:
-            return False
-        try:
-            self.frame_queue.put(frame, block=False)
-            return True
-        except queue.Full:
-            return False
-    
-    def stop(self):
-        """Stop display thread"""
-        self.running = False
-
-
-class InteractivePipeline:
-    """Interactive AI Avatar Pipeline"""
+class VideoModePipeline:
+    """AI Avatar Pipeline - Saves video and auto-plays"""
     
     def __init__(self):
         self.source_loader = None
@@ -127,18 +40,20 @@ class InteractivePipeline:
         self.tts = None
         self.wav2lip = None
         self.face_coords = None
-        self.display = None
+        self.output_dir = Path("output")
+        self.output_dir.mkdir(exist_ok=True)
         
     async def initialize(self):
         """Initialize all components"""
         try:
             print("\n" + "="*70)
-            print("🤖 AI AVATAR - INTERACTIVE MODE")
+            print("🤖 AI AVATAR - AUTO-PLAY VIDEO MODE")
             print("="*70)
+            print("\n✨ No display issues - videos auto-play in your video player!\n")
             
-            # Load source (image or video based on config)
+            # Load source (image or video)
             source_path = config.SOURCE_IMAGE_PATH if config.SOURCE_TYPE == "image" else config.SOURCE_VIDEO_PATH
-            logger.info(f"Loading source {config.SOURCE_TYPE}: {source_path}")
+            logger.info(f"Loading source {config.SOURCE_TYPE}: {source_path.name}")
             self.source_loader = SourceLoader(source_path)
             
             logger.info("Detecting face...")
@@ -171,15 +86,6 @@ class InteractivePipeline:
             )
             self.wav2lip.load_model()
             
-            logger.info("Starting display window...")
-            self.display = DisplayThread(window_name="🤖 AI Avatar", target_fps=25)
-            self.display.start()
-            time.sleep(0.5)  # Let window initialize
-            
-            # Show idle frame
-            idle_frame = self.source_loader.get_next_frame()
-            self.display.show_frame(idle_frame)
-            
             print("\n✅ System ready!")
             print("="*70)
             
@@ -187,17 +93,12 @@ class InteractivePipeline:
             logger.error(f"Failed to initialize: {e}")
             raise
     
-    async def process_text(self, text: str):
-        """Process text and display in real-time"""
+    async def process_text(self, text: str, video_num: int = 1):
+        """Process text and generate video"""
         try:
             print(f"\n💭 You: {text}")
             print("-"*70)
-            
-            # Show thinking status
-            status_frame = self.source_loader.get_next_frame().copy()
-            cv2.putText(status_frame, "Thinking...", (50, 100),
-                       cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 3)
-            self.display.show_frame(status_frame)
+            print("⏳ Processing... (Generating response, TTS, and lip-sync)")
             
             # Generate response
             token_queue = asyncio.Queue()
@@ -223,16 +124,12 @@ class InteractivePipeline:
             print(f"🤖 AI: {full_response}")
             print("-"*70)
             
-            # Show speaking status
-            status_frame = self.source_loader.get_next_frame().copy()
-            cv2.putText(status_frame, "Speaking...", (50, 100),
-                       cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
-            self.display.show_frame(status_frame)
-            
             # Generate TTS
+            logger.info("Generating speech...")
             audio_bytes = await self.tts.text_to_audio(full_response)
             
             # Generate lip-sync
+            logger.info("Generating lip-sync video...")
             from pydub import AudioSegment
             import io
             
@@ -246,21 +143,56 @@ class InteractivePipeline:
             
             synced_frames = self.wav2lip.generate_lip_sync(face_frame, audio_array)
             
-            # Display frames
-            for synced_face in synced_frames:
-                if not self.display.running:
-                    break
-                    
-                synced_face_resized = cv2.resize(synced_face, (w, h))
-                output_frame = self.source_loader.get_next_frame()
-                output_frame[y:y+h, x:x+w] = synced_face_resized
-                
-                self.display.show_frame(output_frame)
-                await asyncio.sleep(0.04)
+            # Save to video file
+            output_path = self.output_dir / f"avatar_response_{video_num}.mp4"
+            logger.info(f"Saving video to {output_path}...")
             
-            # Show idle frame
-            idle_frame = self.source_loader.get_next_frame()
-            self.display.show_frame(idle_frame)
+            # Paste synced faces back to full frames
+            output_frames = []
+            for synced_face in synced_frames:
+                synced_face_resized = cv2.resize(synced_face, (w, h))
+                output_frame = self.source_loader.get_next_frame().copy()
+                output_frame[y:y+h, x:x+w] = synced_face_resized
+                output_frames.append(output_frame)
+            
+            # Get dimensions from full frame
+            frame_h, frame_w = output_frames[0].shape[:2]
+            
+            # Try multiple codecs
+            saved = False
+            for codec in ['avc1', 'H264', 'XVID', 'MJPG', 'mp4v']:
+                try:
+                    fourcc = cv2.VideoWriter_fourcc(*codec)
+                    out = cv2.VideoWriter(str(output_path), fourcc, 25, (frame_w, frame_h))
+                    if out.isOpened():
+                        logger.info(f"Using codec: {codec}")
+                        for frame in output_frames:
+                            out.write(frame)
+                        out.release()
+                        saved = True
+                        break
+                    out.release()
+                except:
+                    continue
+            
+            if not saved:
+                logger.warning("OpenCV failed, using imageio...")
+                import imageio
+                imageio.mimsave(str(output_path), output_frames, fps=25, codec='libx264', quality=8)
+            
+            print(f"✅ Video saved: {output_path}")
+            
+            # Auto-play video
+            logger.info("Opening video in default player...")
+            try:
+                # Windows: use default video player
+                os.startfile(str(output_path))
+                print("🎬 Video is now playing in your video player!")
+            except Exception as e:
+                logger.warning(f"Could not auto-play: {e}")
+                print(f"📁 Please open the video manually: {output_path}")
+            
+            print("-"*70)
             
         except Exception as e:
             logger.error(f"Error: {e}")
@@ -269,28 +201,27 @@ class InteractivePipeline:
     
     def cleanup(self):
         """Cleanup resources"""
-        if self.display:
-            self.display.stop()
-            self.display.join(timeout=2)
         if self.source_loader:
             self.source_loader.release()
 
 
 async def interactive_mode():
     """Interactive text input mode"""
-    pipeline = InteractivePipeline()
+    pipeline = VideoModePipeline()
     
     try:
         await pipeline.initialize()
         
         print("\n📝 TEXT INPUT MODE")
         print("Type your messages and press Enter.")
+        print("Videos will be saved and auto-played.")
         print("Type 'quit' or 'exit' to stop.")
         print("="*70)
         
-        while pipeline.display.running:
+        video_counter = 1
+        
+        while True:
             try:
-                # Get user input (run in thread to not block async)
                 user_input = await asyncio.to_thread(input, "\n💬 Your message: ")
                 
                 if user_input.lower() in ['quit', 'exit', 'q']:
@@ -298,7 +229,8 @@ async def interactive_mode():
                     break
                 
                 if user_input.strip():
-                    await pipeline.process_text(user_input)
+                    await pipeline.process_text(user_input, video_counter)
+                    video_counter += 1
                     
             except EOFError:
                 break
